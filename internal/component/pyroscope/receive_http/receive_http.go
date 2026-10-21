@@ -26,6 +26,7 @@ import (
 	"github.com/grafana/pyroscope/api/gen/proto/go/push/v1/pushv1connect"
 	typesv1 "github.com/grafana/pyroscope/api/gen/proto/go/types/v1"
 	"github.com/grafana/pyroscope/api/model/labelset"
+	"github.com/klauspost/compress/gzip"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/model/labels"
 	"go.opentelemetry.io/otel/trace"
@@ -49,6 +50,17 @@ type Arguments struct {
 
 	// Intentionally undocumented: controls the experimental debug-info proxy.
 	DebugInfoUploadTimeout time.Duration `alloy:"debug_info_upload_timeout,attr,optional"`
+
+	// RecompressGzipLevel re-gzips /ingest bodies at this level as they are received; zero means passthrough.
+	RecompressGzipLevel int `alloy:"recompress_gzip_level,attr,optional"`
+}
+
+// Validate implements syntax.Validator.
+func (a *Arguments) Validate() error {
+	if a.RecompressGzipLevel < 0 || a.RecompressGzipLevel > gzip.BestCompression {
+		return fmt.Errorf("recompress_gzip_level must be between 0 (disabled) and %d, got %d", gzip.BestCompression, a.RecompressGzipLevel)
+	}
+	return nil
 }
 
 // SetToDefault implements syntax.Defaulter.
@@ -66,6 +78,7 @@ type Component struct {
 	uncheckedCollector     *util.UncheckedCollector
 	appendables            []pyroscope.Appendable
 	debugInfoUploadTimeout time.Duration
+	recompressGzipLevel    int
 	mut                    sync.Mutex
 	logger                 *slog.Logger
 	tracer                 trace.Tracer
@@ -118,6 +131,7 @@ func (c *Component) update(args component.Arguments) (bool, error) {
 
 	c.appendables = newArgs.ForwardTo
 	c.debugInfoUploadTimeout = newArgs.DebugInfoUploadTimeout
+	c.recompressGzipLevel = newArgs.RecompressGzipLevel
 
 	serverNeedsRestarting := !reflect.DeepEqual(c.serverConfig, newArgs.Server.HTTP)
 	if !serverNeedsRestarting {
@@ -229,6 +243,12 @@ func (c *Component) getAppendables() []pyroscope.Appendable {
 	return appendables
 }
 
+func (c *Component) getRecompressGzipLevel() int {
+	c.mut.Lock()
+	defer c.mut.Unlock()
+	return c.recompressGzipLevel
+}
+
 func (c *Component) handleIngest(w http.ResponseWriter, r *http.Request) {
 	appendables := c.getAppendables()
 
@@ -266,7 +286,17 @@ func (c *Component) handleIngest(w http.ResponseWriter, r *http.Request) {
 	// This matches how Append() handles profile data (as RawProfile),
 	// but means the entire profile will be held in memory
 	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, r.Body); err != nil {
+	contentType := r.Header.Values(pyroscope.HeaderContentType)
+	if lvl := c.getRecompressGzipLevel(); lvl > 0 {
+		// Re-compress the profile data as it arrives, so that only the
+		// compressed body is ever held in memory and forwarded.
+		var err error
+		if contentType, err = recompressIngestBody(&buf, r.Body, contentType, lvl); err != nil {
+			l.Warn("Failed to re-compress request body", "err", err)
+			http.Error(w, "Failed to re-compress request body", http.StatusBadRequest)
+			return
+		}
+	} else if _, err := io.Copy(&buf, r.Body); err != nil {
 		l.Warn("Failed to read request body", "err", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -283,7 +313,7 @@ func (c *Component) handleIngest(w http.ResponseWriter, r *http.Request) {
 			defer wg.Done()
 			profile := &pyroscope.IncomingProfile{
 				RawBody:     buf.Bytes(),
-				ContentType: r.Header.Values(pyroscope.HeaderContentType),
+				ContentType: contentType,
 				URL:         r.URL,
 				Labels:      lbls,
 			}

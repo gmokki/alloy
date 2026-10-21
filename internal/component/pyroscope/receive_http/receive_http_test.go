@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/klauspost/compress/gzip"
 	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/phayes/freeport"
@@ -206,6 +207,94 @@ func TestForwardsProfilesIngest(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRecompressIngest verifies that /ingest bodies are re-compressed as they
+// are received when recompress_gzip_level is set, and that the Content-Type
+// header values are forwarded unchanged.
+func TestRecompressIngest(t *testing.T) {
+	withRecompression := func(args *Arguments) { args.RecompressGzipLevel = gzip.BestCompression }
+
+	t.Run("non-multipart body", func(t *testing.T) {
+		appendables := createTestAppendables([]error{nil, nil})
+		port := startComponent(t, appendables, withRecompression)
+
+		raw := testPayload()
+		resp := sendIngestBody(t, port, raw, []string{"application/octet-stream", "ct2"})
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		require.Equal(t, 2, countForwardedProfiles(appendables))
+		for _, app := range appendables {
+			got := app.(*testAppender).lastProfile
+			require.Equal(t, []string{"application/octet-stream", "ct2"}, got.ContentType)
+			require.Less(t, len(got.RawBody), len(raw))
+			require.Equal(t, raw, gunzip(t, got.RawBody))
+		}
+	})
+
+	t.Run("multipart body", func(t *testing.T) {
+		appendables := createTestAppendables([]error{nil})
+		port := startComponent(t, appendables, withRecompression)
+
+		jfr := testPayload()
+		labels := []byte("labels-protobuf-bytes")
+		body, ct := buildJFRMultipart(t, jfr, labels, gzip.BestSpeed)
+		inParts := readParts(t, body, ct)
+
+		resp := sendIngestBody(t, port, body, []string{ct})
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		got := appendables[0].(*testAppender).lastProfile
+		require.NotNil(t, got)
+		require.Equal(t, []string{ct}, got.ContentType, "Content-Type, including the boundary, must be forwarded as-is")
+		require.Less(t, len(got.RawBody), len(body), "expected level 9 to shrink the level-1 body")
+
+		outParts := readParts(t, got.RawBody, got.ContentType[0])
+		require.Len(t, outParts, len(inParts))
+		for i := range inParts {
+			require.Equal(t, inParts[i].header, outParts[i].header)
+			require.True(t, isGzipData(outParts[i].data))
+		}
+		require.Equal(t, jfr, decodePart(t, got.RawBody, ct, "jfr"))
+		require.Equal(t, labels, decodePart(t, got.RawBody, ct, "labels"))
+	})
+
+	t.Run("corrupt body is rejected", func(t *testing.T) {
+		appendables := createTestAppendables([]error{nil})
+		port := startComponent(t, appendables, withRecompression)
+
+		resp := sendIngestBody(t, port, truncatedGzip(t), []string{"application/octet-stream"})
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		require.Equal(t, 0, countForwardedProfiles(appendables))
+	})
+
+	t.Run("disabled forwards as received", func(t *testing.T) {
+		appendables := createTestAppendables([]error{nil})
+		port := startComponent(t, appendables)
+
+		raw := testPayload()
+		resp := sendIngestBody(t, port, raw, []string{"application/octet-stream"})
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.Equal(t, raw, appendables[0].(*testAppender).lastProfile.RawBody)
+	})
+}
+
+// sendIngestBody POSTs body to /ingest with the given Content-Type header values.
+func sendIngestBody(t *testing.T, port int, body []byte, contentType []string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://localhost:%d/ingest?name=test_app", port), bytes.NewReader(body))
+	require.NoError(t, err)
+	for idx := range contentType {
+		if idx == 0 {
+			req.Header.Set(pyroscope.HeaderContentType, contentType[idx])
+			continue
+		}
+		req.Header.Add(pyroscope.HeaderContentType, contentType[idx])
+	}
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	return resp
 }
 
 // TestForwardsProfilesPushV1 verifies the behavior of the
@@ -413,7 +502,7 @@ func verifyForwardedProfiles(
 	}
 }
 
-func startComponent(t *testing.T, appendables []pyroscope.Appendable) int {
+func startComponent(t *testing.T, appendables []pyroscope.Appendable, opts ...func(*Arguments)) int {
 	port, err := freeport.GetFreePort()
 	require.NoError(t, err)
 
@@ -425,6 +514,9 @@ func startComponent(t *testing.T, appendables []pyroscope.Appendable) int {
 			},
 		},
 		ForwardTo: appendables,
+	}
+	for _, opt := range opts {
+		opt(&args)
 	}
 
 	comp, err := New(

@@ -42,11 +42,21 @@ The component starts an HTTP server supporting the following endpoints:
 
 ## Arguments
 
-You can use the following argument with `pyroscope.receive_http`:
+You can use the following arguments with `pyroscope.receive_http`:
 
-| Name         | Type                     | Description                            | Default | Required |
-| ------------ | ------------------------ | -------------------------------------- | ------- | -------- |
-| `forward_to` | `list(ProfilesReceiver)` | List of receivers to send profiles to. |         | yes      |
+| Name                    | Type                     | Description                                                                                  | Default | Required |
+| ----------------------- | ------------------------ | -------------------------------------------------------------------------------------------- | ------- | -------- |
+| `forward_to`            | `list(ProfilesReceiver)` | List of receivers to send profiles to.                                                       |         | yes      |
+| `recompress_gzip_level` | `int`                    | gzip level (`1`-`9`) used to re-compress `/ingest` profiles as they arrive. `0` disables it. | `0`     | no       |
+
+The `recompress_gzip_level` argument re-compresses the profile data of `/ingest` requests with gzip at the given level while the request body is being received.
+This is useful when clients send uncompressed profiles or compress at a low level to save their own CPU, and you want to move the compression work to the {{< param "PRODUCT_NAME" >}} tier before a costly network hop, such as a cross-region transfer.
+Because the data is compressed as it arrives, only the compressed body is held in memory and forwarded to the receivers in `forward_to`.
+Profile data that is already gzipped is decompressed first, and profile data that isn't compressed is gzipped as is.
+Data shorter than 64 bytes is forwarded unchanged, because gzip would only make it larger.
+For multipart JFR requests, each part is re-compressed independently and the request headers and part headers are forwarded unchanged, matching how the Pyroscope server detects compression.
+Requests whose profile data can't be re-compressed, for example because of a corrupt gzip stream, are rejected with `HTTP 400 Bad Request`.
+When set to `0`, the body is forwarded as received.
 
 ## Blocks
 
